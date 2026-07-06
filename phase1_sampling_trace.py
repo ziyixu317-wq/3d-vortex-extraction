@@ -144,39 +144,121 @@ class Phase1_SamplingAndTrace(nn.Module):
         return pathlines
 
 # ==========================================
-# 测试代码示例 (当使用 python 运行此文件时执行)
+# 测试代码示例：如何使用自己的 .vti 文件进行测试
 # ==========================================
-if __name__ == '__main__':
-    print("=== 开始测试阶段一模块 (3D十字采样与迹线计算) ===")
-    
-    # 构造虚假的超参数
-    B, T = 2, 20       # Batch size 和 时间步长
-    D, H, W = 16, 16, 16 # 空间维度分辨率
-    N = 100            # 每个batch测试的候选中心点数量
-    L = 16             # 迹线长度
-    
-    # 初始化设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+import glob
+import os
+import argparse
 
-    # 1. 创建随机的 3D 速度场 (B, T, 3, D, H, W)
-    velocity_field = torch.randn(B, T, 3, D, H, W, device=device)
+def load_vti_series(file_directory, array_name=None):
+    """
+    读取一系列按照时间步命名的 .vti 文件，并将它们组装成 PyTorch 张量。
+    :param file_directory: 存放 .vti 文件的文件夹路径
+    :param array_name: 速度场对应的数组名称，如 'velocity', 'U' 等。
+                       如果为 None，则默认读取第一个 Point Data 数组。
+    :return: velocity_field_tensor (1, T, 3, D, H, W)
+    """
+    try:
+        import vtk
+        from vtk.util.numpy_support import vtk_to_numpy
+    except ImportError:
+        raise ImportError("未检测到 vtk 库，请使用 'pip install vtk' 进行安装")
+
+    # 获取所有的 vti 文件，并按名称（通常按时间步命名的数字）排序
+    vti_files = sorted(glob.glob(os.path.join(file_directory, '*.vti')))
     
-    # 2. 随机生成 N 个中心候选点，坐标归一化在 [-1, 1] 内 (供 grid_sample 正常工作)
-    center_points = torch.rand(B, N, 3, device=device) * 2.0 - 1.0
+    if not vti_files:
+        raise FileNotFoundError(f"在 {file_directory} 中没有找到 .vti 文件！请检查路径。")
     
-    # 3. 实例化网络模块 (参考本地2D默认参数风格)
-    phase1_module = Phase1_SamplingAndTrace(step_size=0.05, L=L, dt=0.1, method='rk4').to(device)
+    print(f"找到 {len(vti_files)} 个 .vti 文件，正在加载...")
+    tensors = []
     
-    # 4. 执行前向传播
-    print("正在执行拉格朗日积分 (RK4)...")
-    pathlines = phase1_module(center_points, velocity_field, start_t_idx=0)
+    for f in vti_files:
+        reader = vtk.vtkXMLImageDataReader()
+        reader.SetFileName(f)
+        reader.Update()
+        image = reader.GetOutput()
+        
+        # VTI 图像维度顺序通常为 (nx, ny, nz) = (W, H, D)
+        dims = image.GetDimensions()
+        
+        point_data = image.GetPointData()
+        if array_name:
+            array = point_data.GetArray(array_name)
+        else:
+            # 默认取第一个存在的数组（通常是速度uvw）
+            array = point_data.GetArray(0)
+            
+        if array is None:
+            raise ValueError(f"在文件 {f} 中没有找到指定的数组！请检查文件结构或指定正确的 array_name")
+            
+        # 转换为 numpy 数组
+        numpy_array = vtk_to_numpy(array)
+        
+        # numpy数组展平时VTK通常是以 z, y, x (D, H, W) 为主序存储的
+        # reshape为 (D, H, W, 3)，代表 (Z维度分辨率, Y维度分辨率, X维度分辨率, 3个速度分量)
+        reshaped_array = numpy_array.reshape((dims[2], dims[1], dims[0], 3))
+        
+        # 转化为 PyTorch tensor，并将通道维度前置: (3, D, H, W)
+        tensor = torch.from_numpy(reshaped_array).float().permute(3, 0, 1, 2)
+        tensors.append(tensor)
+
+    # 沿时间步维度 T 堆叠： (T, 3, D, H, W)
+    velocity_sequence = torch.stack(tensors, dim=0)
     
-    # 5. 验证输出形状
-    expected_shape = (B, N, 7, L, 4)
-    print(f"输出形状: {pathlines.shape}")
-    if pathlines.shape == expected_shape:
-        print("✅ 形状匹配！测试通过。")
-        print(f"样例迹线张量值 (第1批第1点第1分支的首个坐标+时间):\n {pathlines[0, 0, 0, 0]}")
-    else:
-        print(f"❌ 形状不匹配！预期: {expected_shape}, 实际: {pathlines.shape}")
+    # 增加 Batch 维度： (1, T, 3, D, H, W)
+    velocity_field = velocity_sequence.unsqueeze(0)
+    print(f"加载完成！速度场张量维度为: {velocity_field.shape}")
+    
+    return velocity_field
+
+def generate_patch_centers(batch_size, num_patches=100, device='cpu'):
+    """
+    模拟：将连续3D空间划分为局部交叠图块（Patches）并获取图块中心点坐标 p
+    在真实场景中，这里的候选点是通过网格空间等间距划分(P x P x P)或根据流场特征预选得出的。
+    由于 grid_sample 要求坐标范围在 [-1, 1]，此处的候选中心点坐标也需处于此范围。
+    """
+    # 这里我们随机生成均匀分布于 [-1, 1] 之间的点来模拟这 N=100 个图块的中心
+    return torch.rand(batch_size, num_patches, 3, device=device) * 2.0 - 1.0
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="3D十字采样与迹线计算模块测试")
+    parser.add_argument('--vti_dir', type=str, required=True, help='存放VTI文件的文件夹路径')
+    parser.add_argument('--array_name', type=str, default=None, help='VTI文件中速度场数组的名称（可选）')
+    parser.add_argument('--patches', type=int, default=100, help='划分的局部图块(中心点)数量 N')
+    parser.add_argument('--L', type=int, default=16, help='迹线长度')
+    args = parser.parse_args()
+
+    print("=== 开始测试阶段一模块 (使用真实 .vti 数据) ===")
+    try:
+        # 1. 加载真实数据
+        velocity_field = load_vti_series(args.vti_dir, array_name=args.array_name)
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        velocity_field = velocity_field.to(device)
+
+        # 2. 准备中心候选点 (对应于划分的 P x P x P 的局部图块)
+        B, T, C, D, H, W = velocity_field.shape
+        N = args.patches # 测试提取N个图块中心
+        print(f"模拟将空间划分为 {N} 个交叠图块（Patches）...")
+        center_points = generate_patch_centers(B, num_patches=N, device=device)
+
+        # 3. 初始化并调用阶段一网络模块
+        # 如果给定数据的时间步 T 小于需要的轨迹长度 L，则以实际 T 为准
+        actual_L = min(args.L, T)
+        print("初始化阶段一网络模块...")
+        phase1_module = Phase1_SamplingAndTrace(step_size=0.05, L=actual_L, dt=0.1, method='rk4').to(device)
+        
+        print("正在进行真实数据的拉格朗日积分...")
+        pathlines = phase1_module(center_points, velocity_field, start_t_idx=0)
+        
+        print(f"✅ 测试成功！最终的迹线张量维度: {pathlines.shape} (预期为 [1, {N}, 7, {actual_L}, 4])")
+        
+    except FileNotFoundError as e:
+        print(f"❌ 错误: {e}")
+    except ImportError as e:
+        print(f"❌ 错误: {e}")
+    except Exception as e:
+        print(f"❌ 未知错误: {e}")
+
