@@ -128,7 +128,7 @@ def load_vti_series_uvw(file_directory, start_idx=0, end_idx=20):
 
 if __name__ == '__main__':
     # 简单的本地随机数据测试，保证代码能运行
-    print("=== 本地测试阶段一模块 (物理坐标框架) ===")
+    print("=== 本地测试阶段一模块 (物理坐标框架 - 遵循 Patch 局部采样) ===")
     
     # 模拟真实物理边界 (X: -2~8, Y: -2~2, Z: -2~2)
     b_min = [-2.0, -2.0, -2.0]
@@ -141,12 +141,20 @@ if __name__ == '__main__':
     B, T, C, D, H, W = 1, 16, 3, 20, 40, 100
     velocity_field = torch.randn(B, T, C, D, H, W, device=device) * 0.5 + 1.0 # 主流速度给 1.0
     
-    # 模拟撒点
-    N = 10
-    center_points_phys = torch.rand(B, N, 3, device=device)
-    center_points_phys[..., 0] = center_points_phys[..., 0] * 10.0 - 2.0 # -2 ~ 8
-    center_points_phys[..., 1] = center_points_phys[..., 1] * 4.0 - 2.0  # -2 ~ 2
-    center_points_phys[..., 2] = center_points_phys[..., 2] * 4.0 - 2.0  # -2 ~ 2
+    # 模拟在局部 Patch 内撒点 (Patch Size = 32x32x32)
+    # 我们将撒点范围限制在整个边界的 1/3 左右，模拟一个滑动窗口
+    patch_size_ratio = 32.0 / 100.0
+    px_min, py_min, pz_min = b_min
+    px_max = b_min[0] + (b_max[0] - b_min[0]) * patch_size_ratio
+    py_max = b_min[1] + (b_max[1] - b_min[1]) * patch_size_ratio
+    pz_max = b_min[2] + (b_max[2] - b_min[2]) * patch_size_ratio
+    
+    N_seeds = 1024 # 模拟单个 Patch 内的种子点数量
+    print(f"在局部 Patch [{px_min:.1f}~{px_max:.1f}, ...] 内生成 {N_seeds} 个种子点...")
+    center_points_phys = torch.rand(B, N_seeds, 3, device=device)
+    center_points_phys[..., 0] = center_points_phys[..., 0] * (px_max - px_min) + px_min
+    center_points_phys[..., 1] = center_points_phys[..., 1] * (py_max - py_min) + py_min
+    center_points_phys[..., 2] = center_points_phys[..., 2] * (pz_max - pz_min) + pz_min
     
     # 初始化网络
     model = Phase1_SamplingAndTrace(
@@ -157,7 +165,8 @@ if __name__ == '__main__':
         dt=0.1
     ).to(device)
     
-    print("运行拉格朗日积分...")
+    print("运行拉格朗日积分 (十字采样)...")
     pathlines = model(center_points_phys, velocity_field)
-    print(f"迹线输出形状: {pathlines.shape} (预期: B, N, 7, L, 4)")
-    print("测试通过！可以将其上传至 Kaggle 进行真实流场测试。")
+    print(f"迹线输出形状: {pathlines.shape} (预期: B, {N_seeds}, 7, L=16, 4)")
+    print("测试通过！整体流水线已统一为基于 Patch 局部采样的尺度。")
+
