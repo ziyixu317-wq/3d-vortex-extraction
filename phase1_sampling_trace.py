@@ -81,7 +81,7 @@ class Phase1_SamplingAndTrace(nn.Module):
 # =======================================================
 # 辅助函数：针对 u, v, w 分离存储的 VTI 文件的读取函数
 # =======================================================
-def load_vti_series_uvw(file_directory, max_files=20):
+def load_vti_series_uvw(file_directory, start_idx=0, end_idx=20):
     import glob
     import os
     import numpy as np
@@ -91,7 +91,8 @@ def load_vti_series_uvw(file_directory, max_files=20):
     except ImportError:
         raise ImportError("请安装 vtk 库：pip install vtk")
         
-    vti_files = sorted(glob.glob(os.path.join(file_directory, '*.vti')))[:max_files]
+    all_files = sorted(glob.glob(os.path.join(file_directory, '*.vti')))
+    vti_files = all_files[start_idx:end_idx]
     if not vti_files:
         raise FileNotFoundError(f"在 {file_directory} 中没有找到 .vti 文件！")
     print(f"找到 {len(vti_files)} 个 .vti 文件，正在合并 u, v, w 分量...")
