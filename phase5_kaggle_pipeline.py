@@ -13,36 +13,43 @@ from phase1_sampling_trace import Phase1_SamplingAndTrace, load_vti_series_uvw
 from phase2_sge import SpatialGraphEmbedding3D
 from phase3_4_transformer_head import VortexPredictor3D
 
+@torch.no_grad()
 def compute_vorticity_and_ivd(velocity_field):
     """
     计算速度场的涡量和瞬时涡量偏差 (IVD)
+    为了防止 OOM，逐时间步计算并及时释放中间梯度张量
     velocity_field: (B, T, C, D, H, W)，其中 C=3 为 (u, v, w)
-    
-    返回:
-    vorticity: (B, T, 3, D, H, W)
-    ivd: (B, T, 1, D, H, W)
     """
     B, T, C, D, H, W = velocity_field.shape
     assert C == 3, "Velocity field must have 3 channels (u, v, w)"
     
-    # 获取各个分量
-    u = velocity_field[:, :, 0, ...]
-    v = velocity_field[:, :, 1, ...]
-    w = velocity_field[:, :, 2, ...]
+    device = velocity_field.device
+    vorticity = torch.empty((B, T, 3, D, H, W), device=device)
     
-    # dim: 4->W(x), 3->H(y), 2->D(z)
-    du_dx, du_dy, du_dz = torch.gradient(u, dim=(4, 3, 2))
-    dv_dx, dv_dy, dv_dz = torch.gradient(v, dim=(4, 3, 2))
-    dw_dx, dw_dy, dw_dz = torch.gradient(w, dim=(4, 3, 2))
-    
-    # 计算涡量 omega = curl(V)
-    omega_x = dw_dy - dv_dz
-    omega_y = du_dz - dw_dx
-    omega_z = dv_dx - du_dy
-    vorticity = torch.stack([omega_x, omega_y, omega_z], dim=2)  # (B, T, 3, D, H, W)
-    
+    for t in range(T):
+        u = velocity_field[:, t, 0, ...]
+        v = velocity_field[:, t, 1, ...]
+        w = velocity_field[:, t, 2, ...]
+        
+        # dim: 3->W(x), 2->H(y), 1->D(z) (由于去掉了时间步，现在是 B, D, H, W)
+        du_dx, du_dy, du_dz = torch.gradient(u, dim=(3, 2, 1))
+        dv_dx, dv_dy, dv_dz = torch.gradient(v, dim=(3, 2, 1))
+        dw_dx, dw_dy, dw_dz = torch.gradient(w, dim=(3, 2, 1))
+        
+        omega_x = dw_dy - dv_dz
+        omega_y = du_dz - dw_dx
+        omega_z = dv_dx - du_dy
+        
+        vorticity[:, t, 0, ...] = omega_x
+        vorticity[:, t, 1, ...] = omega_y
+        vorticity[:, t, 2, ...] = omega_z
+        
+        # 显式清理中间变量防止 OOM
+        del u, v, w, du_dx, du_dy, du_dz, dv_dx, dv_dy, dv_dz, dw_dx, dw_dy, dw_dz
+        del omega_x, omega_y, omega_z
+        torch.cuda.empty_cache()
+
     # 计算 IVD: 瞬时涡量偏差
-    # 此处使用涡量模长减去其空间均值作为 IVD 的一种近似表示
     omega_mag = torch.norm(vorticity, dim=2, keepdim=True)  # (B, T, 1, D, H, W)
     spatial_mean = omega_mag.mean(dim=(3, 4, 5), keepdim=True)
     ivd = omega_mag - spatial_mean  # (B, T, 1, D, H, W)
