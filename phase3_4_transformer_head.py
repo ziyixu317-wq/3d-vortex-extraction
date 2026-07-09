@@ -49,11 +49,8 @@ class PathlineTransformerLayer3D(nn.Module):
         """
         BN, L, C = x.shape
         
-        # 计算相对位移 \Delta p_{ij} = p_i - p_j
-        # pos.unsqueeze(2): (BN, L, 1, 3) 对应 i
-        # pos.unsqueeze(1): (BN, 1, L, 3) 对应 j
-        delta_p = pos.unsqueeze(2) - pos.unsqueeze(1)  # (BN, L, L, 3)
-        
+        # 计算相对位移 \Delta p_{ij} = pos_j - pos_i (Neighbor - Center) 以严格对齐 2D
+        delta_p = pos.unsqueeze(1) - pos.unsqueeze(2)  # (BN, 1, L, 3) - (BN, L, 1, 3) -> (BN, L, L, 3)
         # \delta(\Delta p_{ij})
         pos_enc = self.pos_mlp(delta_p)  # (BN, L, L, C)
         
@@ -98,15 +95,10 @@ class VortexPredictor3D(nn.Module):
             PathlineTransformerLayer3D(dmodel) for _ in range(num_encoder_layers)
         ])
         self.norm = nn.LayerNorm(dmodel)
+        self.feature_propagation = nn.Linear(dmodel, dmodel)
         
-        # 预测头 (Phase 4) - 与 2D 版本参数一致
-        self.fc = nn.Sequential(
-            nn.Linear(dmodel, dmodel // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(dmodel // 2, dmodel // 4),
-            nn.ReLU(inplace=True)
-        )
-        self.output = nn.Linear(dmodel // 4, num_classes)
+        # 严格对齐 2D: Prediction 只有一个单层 Linear
+        self.fc = nn.Linear(dmodel, 1)
 
     def forward(self, sge_features, center_pathline, full_pos=None):
         r"""
@@ -137,15 +129,22 @@ class VortexPredictor3D(nn.Module):
         x_max, _ = x.max(dim=2)
         x_pooled = x_mean + x_max  # (B, N, dmodel)
         
-        # 3. 涡流分割特征投影
+        # 3. 涡流分割特征投影 (防 OOM: 颠倒特征解码与插值上采样的顺序)
+        # 第一步：先对稀疏点集应用 2D 原有的 feature_propagation (移到插值之前以极大地降低计算量)
+        x_pooled = self.feature_propagation(x_pooled) # (B, N, dmodel)
+        
+        # 第二步：将稀疏点集解码为标量 Logits
+        logits_sparse = self.fc(x_pooled)             # (B, N, 1)
+        
+        # 第三步：将极小体积的标量 Logits 插值回庞大的原始网格，显存堆积断崖式下降 (12GB -> <50MB)
         if full_pos is not None:
             # 需要上采样到全分辨率网格
             sampled_pos = center_pathline[:, :, 0, :3]  # (B, N, 3) 使用 t=0 的位置
-            x_pooled = self.propagate_features(full_pos, sampled_pos, x_pooled)  # (B, M, dmodel)
+            logits = self.propagate_features(full_pos, sampled_pos, logits_sparse)  # (B, M, 1)
+        else:
+            logits = logits_sparse
             
-        logits = self.output(self.fc(x_pooled)).squeeze(-1)       # (B, N) 或 (B, M)
-        
-        return logits
+        return logits.squeeze(-1)       # (B, N) 或 (B, M)
         
     def propagate_features(self, full_pos, sampled_pos, sampled_features, chunk_size=20000):
         r"""
@@ -154,8 +153,7 @@ class VortexPredictor3D(nn.Module):
         """
         B, M, _ = full_pos.shape
         _, N, C = sampled_features.shape
-
-        k = min(3, N)
+        k = min(16, N)
         interpolated_features = []
 
         # 分块处理密集点，避免 M x N 的庞大距离矩阵占满显存
@@ -163,25 +161,25 @@ class VortexPredictor3D(nn.Module):
             chunk_full_pos = full_pos[:, i:i+chunk_size, :]
             chunk_M = chunk_full_pos.shape[1]
 
-            # 计算成对距离矩阵 (B, chunk_M, N)
             inner = -2 * torch.matmul(chunk_full_pos, sampled_pos.transpose(2, 1))
             xx = torch.sum(chunk_full_pos**2, dim=2, keepdim=True)
             yy = torch.sum(sampled_pos**2, dim=2, keepdim=True).transpose(2, 1)
-            pairwise_distance = xx + inner + yy
+            dist_sq = xx + inner + yy
 
-            # 寻找 k=3 最近邻
-            dist, idx = pairwise_distance.topk(k=k, dim=-1, largest=False)
+            # 严格对齐 2D: Top-K (K=16) 邻居并执行 Softmax 权重计算
+            topk_dist, topk_idx = dist_sq.topk(k=k, dim=-1, largest=False)
 
-            # 基于距离的倒数计算权重
-            dist = torch.clamp(dist, min=1e-10)
-            norm = torch.sum(1.0 / dist, dim=2, keepdim=True)
-            weight = (1.0 / dist) / norm  # (B, chunk_M, k)
-
-            # 特征插值 (Batched Gather)
+            # 提取 K 个最近邻居的特征
+            # sampled_features: (B, N, C) -> (B, chunk_M, k, C)
             batch_indices = torch.arange(B).view(B, 1, 1).expand(B, chunk_M, k)
-            gathered_features = sampled_features[batch_indices, idx]  # (B, chunk_M, k, C)
+            knn_features = sampled_features[batch_indices, topk_idx]
             
-            chunk_interpolated = torch.sum(weight.unsqueeze(-1) * gathered_features, dim=2)  # (B, chunk_M, C)
+            # Softmax(-距离)
+            weights = F.softmax(-topk_dist, dim=2)
+            
+            chunk_interpolated = torch.sum(weights.unsqueeze(-1) * knn_features, dim=2)
+            # 已在 forward 阶段针对稀疏点集执行了 self.feature_propagation，此处只做纯几何插值
+            
             interpolated_features.append(chunk_interpolated)
 
         return torch.cat(interpolated_features, dim=1)  # (B, M, C)
