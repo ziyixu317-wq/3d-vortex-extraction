@@ -147,7 +147,7 @@ class VortexPredictor3D(nn.Module):
         
         return logits
         
-    def propagate_features(self, full_pos, sampled_pos, sampled_features, chunk_size=100000):
+    def propagate_features(self, full_pos, sampled_pos, sampled_features, chunk_size=20000):
         r"""
         类似 PointNet++ 的距离反比插值特征传播模块
         加入 Chunking 机制，防止 640x240x80 (千万级) 密集网格导致 OOM 显存爆炸
