@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
 import sys
+import vtk
+from vtk.util import numpy_support
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -151,6 +153,51 @@ def visualize_3d_mask(prob_grid, gt_mask, save_path="kaggle_pipeline_visualizati
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"密集流场 3D 掩码可视化结果已保存至 {save_path}")
 
+def save_vti(save_path, prob_grid, gt_mask, bounds):
+    """
+    导出 3D 张量为 ParaView 可视化的 .vti 文件
+    prob_grid: (D, H, W) 模型预测概率
+    gt_mask: (D, H, W) 真实 IVD 标签
+    bounds: (xmin, xmax, ymin, ymax, zmin, zmax)
+    """
+    D, H, W = prob_grid.shape
+    
+    image = vtk.vtkImageData()
+    image.SetDimensions(W, H, D)
+    
+    sx = (bounds[1] - bounds[0]) / (W - 1) if W > 1 else 1.0
+    sy = (bounds[3] - bounds[2]) / (H - 1) if H > 1 else 1.0
+    sz = (bounds[5] - bounds[4]) / (D - 1) if D > 1 else 1.0
+    
+    image.SetSpacing(sx, sy, sz)
+    image.SetOrigin(bounds[0], bounds[2], bounds[4])
+    
+    # PyTorch 默认 C-contiguous 存储顺序 (D, H, W)，即 W (X 轴) 变化最快，与 VTK 完美对齐
+    prob_np = prob_grid.detach().cpu().numpy().flatten()
+    gt_np = gt_mask.detach().cpu().numpy().flatten()
+    pred_np = (prob_np > 0.5).astype(np.float32)
+    
+    # 将概率标量添加到 VTK 点数据
+    prob_vtk = numpy_support.numpy_to_vtk(num_array=prob_np, deep=True, array_type=vtk.VTK_FLOAT)
+    prob_vtk.SetName("Pred_Prob")
+    image.GetPointData().AddArray(prob_vtk)
+    
+    # 将二值化预测掩码添加到 VTK 点数据
+    pred_vtk = numpy_support.numpy_to_vtk(num_array=pred_np, deep=True, array_type=vtk.VTK_FLOAT)
+    pred_vtk.SetName("Pred_Mask")
+    image.GetPointData().AddArray(pred_vtk)
+    
+    # 将真实标签掩码添加到 VTK 点数据
+    gt_vtk = numpy_support.numpy_to_vtk(num_array=gt_np, deep=True, array_type=vtk.VTK_FLOAT)
+    gt_vtk.SetName("GT_IVD_Mask")
+    image.GetPointData().AddArray(gt_vtk)
+    
+    writer = vtk.vtkXMLImageDataWriter()
+    writer.SetFileName(save_path)
+    writer.SetInputData(image)
+    writer.Write()
+    print(f"成功导出 VTI 文件至 {save_path}")
+
 def main():
     parser = argparse.ArgumentParser(description="Kaggle 真实数据集联调验证脚本")
     parser.add_argument('--data_dir', type=str, default='/kaggle/input/datasets/ziyixu317/halfcylinder3d-re640',
@@ -224,13 +271,24 @@ def main():
     # --- 阶段二：图嵌入 ---
     print("-> 运行阶段二 (Phase 2): 空间图嵌入")
     phase2 = SpatialGraphEmbedding3D(in_channels=7, dmodel=args.dmodel).to(device)
+    predictor = VortexPredictor3D(dmodel=args.dmodel).to(device)
+    
+    # 检测是否在 Kaggle 上有刚刚训练好的权重文件
+    weight_path = '/kaggle/working/weights/3d_vortex_model_latest.pth'
+    if os.path.exists(weight_path):
+        print(f"检测到训练权重 {weight_path}，正在加载参数...")
+        checkpoint = torch.load(weight_path, map_location=device)
+        phase2.load_state_dict(checkpoint['phase2_state_dict'])
+        predictor.load_state_dict(checkpoint['predictor_state_dict'])
+        print("权重加载成功！开始基于训练权重的全流场推理...")
+    else:
+        print("未检测到训练权重，使用随机初始化权重进行推理...")
+        
     sge_features = phase2(pathlines_features, positions)
     
     # --- 阶段三/四：时序 Transformer 与预测 ---
     print("-> 运行阶段三/四 (Phase 3 & 4): 时空演化重组、特征上采样与最终二值化掩码预测")
     center_positions = positions[:, :, 0, :, :]  # (1, N, L, 3)
-    
-    predictor = VortexPredictor3D(dmodel=args.dmodel).to(device)
     
     # 输入 full_pos 让网络自动执行 propagate_features 到整个 D*H*W 网格
     logits_full = predictor(sge_features, center_positions, full_pos=full_pos) # (1, D*H*W)
@@ -242,10 +300,15 @@ def main():
     prob_grid = prob_full.view(D, H, W)
     print(f"预测与空间拼接完成！输出 3D 掩码维度: {prob_grid.shape}")
     
-    # 4. 可视化呈现：拼接后的概率分布 vs IVD Ground Truth
-    save_path = "kaggle_pipeline_visualization.png"
-    visualize_3d_mask(prob_grid, gt_mask_t0, save_path)
-    print("整体代码流水线验证成功，特征反投影与完整掩码流场拼接顺利执行完毕！")
+    # 4. 可视化呈现与 VTI 导出
+    save_path_img = "kaggle_pipeline_visualization.png"
+    visualize_3d_mask(prob_grid, gt_mask_t0, save_path_img)
+    
+    # 导出包含真实标签、模型概率、以及二值化掩码的 VTI 文件
+    save_path_vti = "prediction_result_t0.vti"
+    save_vti(save_path_vti, prob_grid, gt_mask_t0, bounds)
+    
+    print("整体代码流水线验证成功，特征反投影、全流场拼接以及 VTI 导出顺利执行完毕！")
 
 if __name__ == '__main__':
     main()
