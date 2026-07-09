@@ -198,13 +198,14 @@ def save_vti(save_path, prob_grid, gt_mask, bounds):
     writer.Write()
     print(f"成功导出 VTI 文件至 {save_path}")
 
+@torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description="Kaggle 真实数据集联调验证脚本")
     parser.add_argument('--data_dir', type=str, default='/kaggle/input/datasets/ziyixu317/halfcylinder3d-re640',
                         help='VTI 文件所在的目录路径')
     parser.add_argument('--start_idx', type=int, default=0, help='起始时间步')
     parser.add_argument('--end_idx', type=int, default=16, help='结束时间步 (Kaggle 防 OOM，建议小范围)')
-    parser.add_argument('--num_seeds', type=int, default=2048, help='Patch 内部采样的种子点数量 N')
+    parser.add_argument('--num_seeds', type=int, default=1024, help='Patch 内部采样的种子点数量 N')
     parser.add_argument('--dmodel', type=int, default=252, help='Transformer 隐层维度')
     args = parser.parse_args()
     
@@ -238,6 +239,10 @@ def main():
     physical_features = torch.cat([velocity_field, vorticity, ivd], dim=2)
     print(f"融合后物理场特征维度: {physical_features.shape}")
     
+    # 极度重要：释放中间张量以节省推理时的 5.5GB 显存
+    del velocity_field, vorticity, ivd
+    torch.cuda.empty_cache()
+    
     # 3. 生成全流场密集网格，并从中抽取 N 个采样点作为追踪种子
     # Meshgrid: X, Y, Z (注意 PyTorch meshgrid 对应的维度顺序)
     print(f"生成全局密集网格 ({D}x{H}x{W}) 并采样 {args.num_seeds} 个迹线种子点...")
@@ -262,7 +267,7 @@ def main():
         L=L_steps, dt=0.05
     ).to(device)
     
-    pathlines_phys = phase1(center_points_phys, velocity_field)
+    pathlines_phys = phase1(center_points_phys, physical_features[:, :, :3, ...])
     positions = pathlines_phys[..., :3]  # (1, N, K, L, 3)
     
     print("-> 获取演化迹线上的物理特征")
@@ -283,6 +288,9 @@ def main():
         print("权重加载成功！开始基于训练权重的全流场推理...")
     else:
         print("未检测到训练权重，使用随机初始化权重进行推理...")
+        
+    phase2.eval()
+    predictor.eval()
         
     sge_features = phase2(pathlines_features, positions)
     
