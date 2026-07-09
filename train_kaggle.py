@@ -16,7 +16,7 @@ def train_kaggle():
     parser.add_argument('--data_dir', type=str, default='/kaggle/input/datasets/ziyixu317/halfcylinder3d-re640')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--num_seeds', type=int, default=4096)
+    parser.add_argument('--num_seeds', type=int, default=1024)
     parser.add_argument('--dmodel', type=int, default=252)
     args = parser.parse_args()
 
@@ -45,6 +45,10 @@ def train_kaggle():
     vorticity, ivd = compute_vorticity_and_ivd(velocity_field)
     gt_mask_seq = compute_ivd_ground_truth(ivd)
     physical_features = torch.cat([velocity_field, vorticity, ivd], dim=2)
+    
+    # 极度重要：释放中间张量，直接节省高达 5.5 GB 显存！
+    del velocity_field, vorticity, ivd
+    torch.cuda.empty_cache()
     
     # 2. 初始化网络模型与优化器
     phase1 = Phase1_SamplingAndTrace(bounds_min=b_min.cpu().numpy(), bounds_max=b_max.cpu().numpy(), L=T, dt=0.05).to(device)
@@ -78,7 +82,8 @@ def train_kaggle():
         center_points_phys = full_pos[:, sampled_idx, :] # (1, N, 3)
 
         # ---------------- 前向传播 ----------------
-        pathlines_phys = phase1(center_points_phys, velocity_field)
+        # velocity_field 已经被清理，直接使用 physical_features 的前 3 个通道
+        pathlines_phys = phase1(center_points_phys, physical_features[:, :, :3, ...])
         positions = pathlines_phys[..., :3]
         pathlines_features = sample_features(physical_features, positions, b_min, b_max)
         
